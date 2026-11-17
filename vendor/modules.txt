@@ -1,0 +1,30 @@
+# github.com/soypat/lneto v0.4.0
+## explicit; go 1.24
+github.com/soypat/lneto
+github.com/soypat/lneto/arp
+github.com/soypat/lneto/crypto/internal/lcrypto
+github.com/soypat/lneto/crypto/tlsraw
+github.com/soypat/lneto/dhcp/dhcpv4
+github.com/soypat/lneto/dns
+github.com/soypat/lneto/dns/edns0
+github.com/soypat/lneto/dns/mdns
+github.com/soypat/lneto/ethernet
+github.com/soypat/lneto/http/httpraw
+github.com/soypat/lneto/internal
+github.com/soypat/lneto/internet
+github.com/soypat/lneto/internet/pcap
+github.com/soypat/lneto/ipv4
+github.com/soypat/lneto/ipv4/icmpv4
+github.com/soypat/lneto/ipv6
+github.com/soypat/lneto/ipv6/icmpv6
+github.com/soypat/lneto/ntp
+github.com/soypat/lneto/tcp
+github.com/soypat/lneto/udp
+github.com/soypat/lneto/x/netdev
+github.com/soypat/lneto/x/xnet
+# tinygo.org/x/espradio v0.5.0
+## explicit; go 1.24.4
+tinygo.org/x/espradio
+tinygo.org/x/espradio/esp32
+tinygo.org/x/espradio/esp32c3
+tinygo.org/x/espradio/esp32s3

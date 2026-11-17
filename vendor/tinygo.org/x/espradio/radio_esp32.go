@@ -1,0 +1,125 @@
+//go:build esp32
+
+package espradio
+
+/*
+#cgo CFLAGS: -Iblobs/include
+#cgo CFLAGS: -Iblobs/include/esp32
+#cgo CFLAGS: -Iblobs/include/local
+#cgo CFLAGS: -DCONFIG_IDF_TARGET_ESP32=1
+#cgo CFLAGS: -DCONFIG_SOC_WIFI_NAN_SUPPORT=0
+#cgo CFLAGS: -DESPRADIO_PHY_PATCH_ROMFUNCS=0
+#cgo CFLAGS: -fno-short-enums
+#cgo LDFLAGS: -Lblobs/libs/esp32 -lcoexist -lcore -lmesh -lnet80211 -lespnow -lregulatory -lphy -lpp -lrtc -lwpa_supplicant -lbtdm_app
+
+#include "espradio.h"
+*/
+import "C"
+
+import (
+	"runtime/interrupt"
+	"unsafe"
+
+	_ "tinygo.org/x/espradio/esp32"
+)
+
+// ─── Hardware init ───────────────────────────────────────────────────────────
+
+// CPU interrupt number for WiFi MAC. On Xtensa, TinyGo dispatches only lines
+// 6-30. Interrupt 12 is a level-triggered, level-1 interrupt in the allocatable range.
+const wifiCPUInterrupt = 12
+
+func initHardware() error {
+	// esp-hal's ESP32 radio init only enables the WiFi/BT clock gates; it does
+	// not power-cycle or reset the modem here (the ROM bootloader already
+	// powered up the WiFi domain, and there is no WiFi MAC reset bit in
+	// DPORT.CORE_RST_EN). The actual clock enable is done in
+	// espradio_hal_init_clocks_go, called from Enable().
+	// See: esp-radio/src/radio_clocks/clocks_ll/esp32.rs
+	return nil
+}
+
+// ESP32 uses the CPU clock counter (CCOUNT) at 240 MHz by default.
+// However, for systimer compatibility with the espradio framework, we use
+// the FRC timer at 80 MHz (APB clock / 256 = 312.5 KHz, but we actually
+// use esp_timer_get_time which returns microseconds).
+// The blob uses esp_timer_get_time (microseconds), so ticksPerSecond = 1MHz.
+const ticksPerSecond = 16_000_000
+
+// ESP32 arena lives in a dedicated region in safe upper SRAM1 (see _arena_start
+// in esp32.ld), outside the Go GC heap. This value is an upper bound; the actual
+// size is clamped to the linker-reserved region (the remainder of DRAM1 after
+// .bss), so it uses whatever space is left there.
+const arenaPoolSize = 48 * 1024
+
+// rxRingSize is the default RX ring size in frames.
+const rxRingSize = 6
+
+// Linker symbols bounding the dedicated arena region (remainder of DRAM1).
+//
+//go:extern _arena_start
+var espradioArenaStart [0]byte
+
+//go:extern _arena_end
+var espradioArenaEnd [0]byte
+
+// makeArenaPool returns a slice over the dedicated arena region reserved in the
+// linker script, outside the Go GC heap. This isolates WiFi DMA buffers from
+// GC-managed Go objects and keeps them off the SRAM2 heap.
+func makeArenaPool(size int) []byte {
+	start := uintptr(unsafe.Pointer(&espradioArenaStart))
+	end := uintptr(unsafe.Pointer(&espradioArenaEnd))
+	if region := int(end - start); size > region {
+		size = region
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(&espradioArenaStart)), size)
+}
+
+// makeRxRing returns a slice over the .rxring region reserved in the linker
+// script, clamped to its size.
+func makeRxRing(size int) []byte {
+	if region := int(C.espradio_netif_rx_ring_static_size()); size > region {
+		size = region
+	}
+	return unsafe.Slice((*byte)(C.espradio_netif_rx_ring_static()), size)
+}
+
+// ESP32 (Xtensa): don't run the blob ISR from interrupt context — the deep
+// windowed call chains can overflow the interrupted goroutine's 8KB stack.
+// Just mask the level-triggered interrupt and wake the scheduler; schedOnce()
+// will call espradio_call_wifi_isr() on its own goroutine stack.
+func wifiISRHandler(interrupt.Interrupt) {
+	countHWWiFiISR()
+	C.espradio_ints_off(C.uint32_t(1 << wifiCPUInterrupt))
+	// Unthrottled deliberately: a real hardware event, and here it is the only
+	// thing that will run the blob ISR, since this handler does not.
+	kickSched()
+}
+
+// BT interrupt handlers
+
+// Free level 1 lines. These must agree with esp32/isr.c and bt_ble_esp32.c.
+// Line 12 is the WiFi line on this chip.
+const (
+	btCPUInt5 = 13 // RWBT + BT_BB → CPU interrupt 13
+	btCPUInt8 = 17 // RWBLE → CPU interrupt 17
+)
+
+func setupBTInterrupts() {
+	intr5 := interrupt.New(btCPUInt5, btISR5Handler)
+	intr5.Enable()
+	intr8 := interrupt.New(btCPUInt8, btISR8Handler)
+	intr8.Enable()
+}
+
+// These handlers must not run the blob ISR, because TinyGo dispatches the
+// interrupt on the stack of the goroutine that was interrupted.
+func btISR5Handler(interrupt.Interrupt) {
+	C.espradio_bt_isr_latch_5()
+	kickSched()
+}
+
+func btISR8Handler(interrupt.Interrupt) {
+	C.espradio_bt_isr_latch_8()
+	kickSched()
+}

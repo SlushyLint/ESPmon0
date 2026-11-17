@@ -1,0 +1,756 @@
+package tcp
+
+import (
+	"io"
+	"net"
+	"sync/atomic"
+
+	"log/slog"
+
+	"github.com/soypat/lneto"
+	"github.com/soypat/lneto/internal"
+)
+
+// Handler is a low level TCP handling data structure. It implements logic
+// related to data buffering, frame sequencing and connection state handling.
+// Does NOT implement IP related logic, so no CRC calculation/validation or pseudo header logic.
+//
+// See [Conn] for a higher level abstraction of a TCP connection, and see [ControlBlock] for the low level state machine of a TCP connection.
+type Handler struct {
+	// connid is [lneto.StackNode.ConnectionID] value. Changes on clean close tx finish
+	// while handle stays unchanged so users holding a [ConnHandle] can keep reading until [io.EOF].
+	connid atomic.Uint32
+	// handle is used primarily by [ConnHandle] to keep track of
+	// instance validity throughout asynchronous user interaction similar to a generational handle.
+	handle atomic.Uint32
+	scb    ControlBlock
+	bufTx  ringTx
+	bufRx  internal.Ring
+	logger
+	validator  lneto.Validator
+	localPort  uint16
+	remotePort uint16
+
+	optcodec OptionCodec
+	// Window scaling (RFC 7323 §2). wndShiftLocal is derived from the receive
+	// buffer in [Handler.SetBuffers], wndShiftPeer learned from the peer's offer.
+	// Scaling lives at the wire seam only: the ControlBlock always holds real
+	// octet counts, converted on frame read ([Handler.Recv]) and write
+	// ([Handler.wireWnd]).
+	wndShiftLocal uint8
+	wndShiftPeer  uint8
+	peerOfferedWS bool
+	// reasm tracks out-of-order segments staged in bufRx's free region. Always
+	// enabled once buffers are set (see [Handler.SetBuffers]).
+	reasm  reassembly
+	policy Policy
+
+	closing    bool
+	shutdownRx bool
+	// nRetransmit stores the number of times the oldest packet was retransmit.
+	nRetransmit    uint8
+	requeueControl bool
+	synUnsent      bool // Can't be derived from ControlBlock :(
+
+	// RESETTABLE STATE MUST BE ZEROED IN [Handler.reset]
+}
+
+// reset clears all state except [ControlBlock] state. So [Handler.State] will remain unchanged. See [Handler.Abort] for full reset.
+func (h *Handler) reset(localPort, remotePort uint16, iss Value) {
+	h.handle.Add(1)
+	h.connid.Add(1) // Accessed concurrently by stacks.
+	h.localPort = localPort
+	h.remotePort = remotePort
+	h.closing = false
+	h.shutdownRx = false
+	h.requeueControl = false
+	h.synUnsent = false
+	h.peerOfferedWS = false
+	// h.wndShiftLocal derived from local buffers which stay, so not reset.
+	h.wndShiftPeer = 0
+	h.nRetransmit = 0
+	if h.policyEnabled() {
+		h.policy.Reset()
+	}
+	h.reasm.clear() // preserve metadata capacity across reopen, drop held segments.
+	h.bufTx.ResetOrReuse(nil, 0, iss)
+	h.bufRx.Reset()
+}
+
+// SetLoggers sets the [slog.Logger] for the Handler and internal [ControlBlock].
+func (h *Handler) SetLoggers(handler, scb *slog.Logger) {
+	h.logger.log = handler
+	h.scb.logger.log = scb
+}
+
+// ConnectionID returns the stack registration identifier. It changes every time the connection
+// is opened, aborted or done transmitting after a clean close; stacks discard the registration then.
+func (h *Handler) ConnectionID() *atomic.Uint32 {
+	return &h.connid
+}
+
+// State returns the state of the TCP state machine as per RFC9293. See [State].
+func (h *Handler) State() State { return h.scb.State() }
+
+// SetBuffers sets the internal buffers used to receive and transmit bytes asynchronously via [Handler.Write] and [Handler.Read] calls.
+// If the argument buffer is nil then the respective currently set buffer will be reused.
+func (h *Handler) SetBuffers(txbuf, rxbuf []byte, packets int) error {
+	if h.bufRx.Buf == nil && (len(rxbuf) < minBufferSize || len(txbuf) < minBufferSize) {
+		return lneto.ErrShortBuffer
+	}
+	if !h.scb.State().IsClosed() {
+		return lneto.ErrInvalidConfig
+	}
+	if rxbuf != nil {
+		h.bufRx.Buf = rxbuf
+	}
+	h.scb.SetRecvWindow(Size(h.bufRx.Size()))
+	h.wndShiftLocal = wndShiftFor(h.bufRx.Size())
+	h.bufRx.Reset()
+	h.reasm.reset(maxReasmSegments)
+	return h.bufTx.ResetOrReuse(txbuf, packets, 0)
+}
+
+// SetPolicy installs the transmit-steering algorithm. nil disables it.
+// It should be set before the connection is opened. See [Policy].
+func (h *Handler) SetPolicy(policy Policy) {
+	h.policy = policy
+}
+func (h *Handler) policyEnabled() bool { return h.policy != nil }
+
+// ControlBlock returns the state machine underlying the Handler, mainly so a
+// [Policy] can read the sequence spaces. Not for modification.
+func (h *Handler) ControlBlock() *ControlBlock { return &h.scb }
+
+// Reassembly returns a live, read-only view of the held out-of-order data.
+// The view shares the Handler's lifetime and concurrency requirements.
+func (h *Handler) Reassembly() ReassemblyView { return ReassemblyView{r: &h.reasm} }
+
+// LocalPort returns the local port of the connection. Returns 0 if the connection is closed and uninitialized.
+func (h *Handler) LocalPort() uint16 {
+	return h.localPort
+}
+
+// RemotePort returns the remote port of the connection if it is set.
+// If the connection is passive and has not yet been established it will return 0.
+func (h *Handler) RemotePort() uint16 {
+	return h.remotePort
+}
+
+// OpenActive opens an "active" TCP connection to a known remote port. The caller holds knowledge of the IP address.
+// OpenActive is used by TCP Clients to initiate a connection.
+func (h *Handler) OpenActive(localPort, remotePort uint16, iss Value) error {
+	if remotePort == 0 {
+		return lneto.ErrZeroDestination
+	} else if h.bufRx.Size() < minBufferSize || h.bufTx.Size() < minBufferSize {
+		return errBufferTooSmall
+	} else if h.scb.State() != StateClosed && h.scb.State() != StateTimeWait {
+		return errNeedClosedTCBToOpen
+	}
+	// reset/Abort prepares a SCB for active connection by resetting state to closed.
+	h.scb.reset()
+	h.reset(localPort, remotePort, iss)
+	h.synUnsent = true
+	h.scb.SetRecvWindow(Size(h.bufRx.Size()))
+	return nil
+}
+
+// OpenListen prepares a passive TCP connection where the Handler acts as a server.
+// OpenListen is used by TCP Servers to begin listening for remote connections.
+func (h *Handler) OpenListen(localPort uint16, iss Value) error {
+	if localPort == 0 {
+		return lneto.ErrZeroSource
+	} else if h.bufRx.Size() < minBufferSize || h.bufTx.Size() < minBufferSize {
+		return errBufferTooSmall
+	}
+	// Open will fail unless SCB in closed state.
+	err := h.scb.Open(iss, Size(h.bufRx.Size()))
+	if err != nil {
+		return err
+	}
+	h.reset(localPort, 0, iss)
+	return nil
+}
+
+// Abort forcibly terminates all state associated to current connection.
+// After a call to abort no more data can be sent nor received over the connection.
+func (h *Handler) Abort() {
+	h.info("tcp.Handler.Abort")
+	h.scb.Abort()
+	h.reset(0, 0, 0)
+}
+
+// isAborted reports whether connection state was discarded. Only [Handler.reset] clears
+// remotePort, and clean closes never reset: zero remotePort means aborted or never connected.
+func (h *Handler) isAborted() bool { return h.remotePort == 0 }
+
+// Recv receives an incoming TCP packet frame with the first byte being the first octet of the TCP frame.
+// The [Handler]'s internal state is updated if the packet is admitted successfully.
+func (h *Handler) Recv(incomingPacket []byte) error {
+	if h.IsTxOver() {
+		return net.ErrClosed
+	}
+	tfrm, err := NewFrame(incomingPacket)
+	if err != nil {
+		return err
+	}
+	tfrm.ValidateExceptCRC(&h.validator)
+	err = h.validator.ErrPop()
+	if err != nil {
+		return err
+	}
+
+	remotePort := tfrm.SourcePort()
+	if h.remotePort != 0 && remotePort != h.remotePort {
+		return lneto.ErrMismatch
+	}
+	dstPort := tfrm.DestinationPort()
+	if h.localPort != dstPort {
+		return lneto.ErrMismatch
+	}
+	payload := tfrm.Payload()
+	segIncoming := tfrm.Segment(len(payload))
+	if segIncoming.Flags.HasAny(FlagSYN) {
+		// Disable TCP fast open, force peer to retransmit.
+		payload, segIncoming.DATALEN = nil, 0
+	} else if h.peerOfferedWS {
+		// Peer windows arrive scaled once both sides offered scaling, but never on
+		// SYN segments (RFC 7323 §2.2). Restore real octets before the
+		// ControlBlock sees them.
+		segIncoming.WND <<= h.wndShiftPeer
+	}
+	if h.scb.IncomingIsKeepalive(segIncoming) {
+		h.info("tcp.Handler:rx-keepalive", slog.Uint64("port", uint64(h.localPort)))
+		return nil
+	}
+
+	if h.policyEnabled() && !h.policy.PreRx(h, tfrm) {
+		return nil
+	}
+
+	// Out-of-order reassembly: buffer in-window data that arrived ahead of the
+	// next expected sequence number before the ControlBlock (sequential-only)
+	// would reject it. Buffered segments live in bufRx's free region.
+	if h.reasm.enabled() && h.handleOutOfOrder(segIncoming, payload) {
+		return nil
+	}
+	// After a zero window is advertised the ControlBlock refuses and ACKs data itself.
+	if !h.shutdownRx && len(payload) > h.bufRx.Free() && h.scb.RecvWindow() != 0 {
+		return lneto.ErrBufferFull
+	}
+
+	prevState := h.scb.State()
+	prevUNA := h.scb.snd.UNA // Capture before Recv updates snd.UNA (RFC 6298 §5.3).
+	err = h.scb.Recv(segIncoming)
+	if err != nil {
+		if h.scb.State() == StateClosed {
+			h.Abort()           // Closed by RST: do not leave Handler armed to resend SYN.
+			err = net.ErrClosed // Signal caller to tear down.
+		}
+		return err
+	}
+	if h.IsTxOver() {
+		// Clean close completed (CLOSED or TIME-WAIT with nothing left to send).
+		h.connid.Add(1)
+	}
+	if h.scb.State() == StateClosed {
+		// TCB aborted, likely because it received an ACK in LastAck state.
+		// Clean up connection now unless read pending.
+		return net.ErrClosed
+	}
+	if prevState != h.scb.State() && h.logenabled(slog.LevelInfo) {
+		h.info("tcp.Handler:rx-statechange", slog.Uint64("port", uint64(h.localPort)), slog.String("old", prevState.String()), slog.String("new", h.scb.State().String()), slog.String("rxflags", segIncoming.Flags.String()))
+	}
+	if h.policyEnabled() {
+		h.policy.PostRx(h, prevState, tfrm)
+	}
+	if segIncoming.DATALEN != 0 && h.shutdownRx && (h.scb.State() == StateFinWait1 || h.scb.State() == StateFinWait2) {
+		// soypat/lneto#50: the application is done in both directions — read side
+		// shut down (CloseRead) and our FIN sent (Close) — so inbound data has no
+		// consumer. Reply RST instead of the silent ACK-and-drop that leaves the
+		// peer waiting; the connection is torn down once the RST is sent.
+		h.info("tcp.Handler:rst-data-after-fullclose", slog.Uint64("lport", uint64(h.localPort)), slog.Uint64("rport", uint64(h.remotePort)), slog.Uint64("datalen", uint64(segIncoming.DATALEN)))
+		h.scb.QueueRST(segIncoming.ACK)
+		return nil
+	}
+	if segIncoming.DATALEN != 0 && !h.shutdownRx {
+		_, err = h.bufRx.Write(payload)
+		if err != nil {
+			return err
+		}
+	}
+	if segIncoming.DATALEN != 0 {
+		// The just-accepted in-order segment may have filled a gap; deliver any
+		// now-contiguous buffered segments.
+		h.deliverReassembled()
+	}
+	if segIncoming.Flags.HasAny(FlagACK) {
+		if segIncoming.ACK == prevUNA {
+			// scb keeping track of duplicate acks.
+			h.info("tcp.Handler:dupack", slog.Uint64("ndupack", uint64(h.scb.dupack)), slog.Uint64("ack", uint64(segIncoming.ACK)), slog.Uint64("lport", uint64(h.localPort)), slog.Uint64("rport", uint64(h.remotePort)))
+		} else {
+			// Update TX ring buffer to free up acked data.
+			h.bufTx.RecvACK(segIncoming.ACK)
+		}
+		if h.bufTx.BufferedSent() == 0 {
+			// FIN occupies sequence space but is not retransmittable payload.
+			h.scb.dupack = 0
+			h.scb.nRetransmit = 0
+		}
+	}
+	if segIncoming.Flags.HasAny(FlagSYN) {
+		// Parse remote MSS from TCP options.
+		h.optcodec.ForEachOption(tfrm.Options(), func(kind OptionKind, data []byte) error {
+			if kind == OptMaxSegmentSize && len(data) == 2 {
+				mss := uint16(data[0])<<8 | uint16(data[1])
+				if mss > 0 {
+					h.scb.snd.MSS = Size(mss)
+				}
+			}
+			if kind == OptWindowScale && len(data) == 1 {
+				// RFC 7323 §2.3: a shift above 14 is clamped, not rejected.
+				h.peerOfferedWS = true
+				h.wndShiftPeer = min(data[0], maxWndShift)
+			}
+			return nil
+		})
+		if h.remotePort == 0 {
+			// Remote reached out and has given us their port, set it on our side.
+			h.debug("tcp.Handler:rx-remoteport-set", slog.Uint64("port", uint64(h.localPort)), slog.Uint64("remoteport", uint64(remotePort)))
+			h.remotePort = remotePort
+		}
+	}
+	if h.logenabled(internal.LevelTrace) {
+		h.trace("tcp.Handler:rx-done",
+			slog.Uint64("lport", uint64(h.localPort)),
+			slog.Uint64("rport", uint64(remotePort)),
+			slog.Uint64("seg.seq", uint64(segIncoming.SEQ)),
+			slog.Uint64("seg.ack", uint64(segIncoming.ACK)),
+			slog.Uint64("seg.datalen", uint64(segIncoming.DATALEN)),
+		)
+	}
+	return nil
+}
+
+// handleOutOfOrder buffers an in-window data segment that arrived ahead of the
+// next expected sequence number and queues a duplicate ACK so the sender fast-
+// retransmits the gap. It returns true when it has consumed the segment; false
+// leaves the segment to the ControlBlock (in-order data, control segments, old
+// or out-of-window segments, or when the reassembly buffer cannot hold it).
+func (h *Handler) handleOutOfOrder(seg Segment, payload []byte) bool {
+	if h.shutdownRx {
+		// Discard mode drops payloads, which would break the ring/rcv.NXT
+		// lockstep reassemble relies on; do not buffer.
+		return false
+	}
+	if seg.DATALEN == 0 || seg.Flags.HasAny(flagctl) {
+		return false // only pure data segments are buffered out of order.
+	}
+	rcvNxt := h.scb.RecvNext()
+	if seg.SEQ == rcvNxt {
+		return false // in order: the ControlBlock handles it normally.
+	}
+	rcvWnd := h.scb.RecvWindow()
+	if !seg.SEQ.InWindow(rcvNxt, rcvWnd) || !seg.Last().InWindow(rcvNxt, rcvWnd) {
+		return false // old or out of window: let the ControlBlock decide.
+	}
+	if !h.reasm.store(&h.bufRx, rcvNxt, seg.SEQ, payload) {
+		return false // no room: fall back to ControlBlock (challenge ACK).
+	}
+	h.scb.pending[0] |= FlagACK // duplicate ACK advertises the gap at rcv.NXT.
+	h.trace("tcp.Handler:rx-ooo", slog.Uint64("seg.seq", uint64(seg.SEQ)), slog.Uint64("rcv.nxt", uint64(rcvNxt)))
+	return true
+}
+
+// deliverReassembled hands any now-contiguous out-of-order segments to the
+// receive stream, advancing rcv.NXT and queuing an ACK for what was delivered.
+func (h *Handler) deliverReassembled() {
+	if h.reasm.buffered() == 0 {
+		return
+	}
+	if h.shutdownRx {
+		// Discard mode skips the gap-filling write, so staged bytes can no
+		// longer be committed coherently; drop them (the peer retransmits).
+		h.reasm.clear()
+		return
+	}
+	if delivered := h.reasm.reassemble(&h.bufRx, h.scb.RecvNext()); delivered > 0 {
+		h.scb.rcv.NXT.UpdateForward(delivered)
+		h.scb.pending[0] |= FlagACK
+	}
+}
+
+// ShutdownRead activates local discard mode: incoming payload bytes are dropped
+// (ACK/SEQ still advance normally) and Read returns [io.EOF] immediately.
+// Not reversible within the lifetime of a connection.
+// If [Handler.Close] and this method are both called then connection will be terminated.
+func (h *Handler) ShutdownRead() {
+	h.shutdownRx = true
+}
+
+// Close will initiate the TCP close sequence.
+// After Close is called [Handler.Write] will fail with [net.ErrClosed].
+// The connection may still receive data to read after Close called.
+func (h *Handler) Close() error {
+	h.trace("tcp.Handler.Close")
+	if h.closing {
+		return errConnectionClosing
+	} else if h.State().IsClosed() {
+		return net.ErrClosed
+	}
+	h.closing = true
+	return nil
+}
+
+// Send writes TCP frame to be sent over the network to the remote peer to `b`.
+// It does no IP interfacing or CRC calculation of packet, which is left to the caller to perform.
+// The returned integer is the length written to the argument buffer.
+func (h *Handler) Send(b []byte) (int, error) {
+	if h.IsTxOver() {
+		return 0, net.ErrClosed
+	}
+	tfrm, err := NewFrame(b)
+	if err != nil {
+		return 0, err
+	}
+	offset := uint8(5)
+	txLimit := TransmitUnlimited
+	var rtxAt Value
+	var rtx bool
+	if h.policyEnabled() {
+		// Hand the Policy a defined frame: zeroed header at the minimum offset.
+		// It may append options and raise the offset, which is read back below.
+		tfrm.ClearHeader()
+		tfrm.SetOffsetAndFlags(offset, 0)
+		limit, rtxFrom, doRtx := h.policy.PreTx(h, tfrm)
+		txLimit = limit
+		if limit == 0 {
+			h.info("tcp.Policy:newTxLimit=0") // Can cause headaches for users.
+		}
+		if doRtx {
+			rtxAt, rtx = h.bufTx.retransmitBoundary(rtxFrom)
+		}
+		if o, _ := tfrm.OffsetAndFlags(); o > offset && int(o)*4 < len(b) {
+			offset = o
+		}
+	}
+	awaitingSyn := h.AwaitingSynSend()
+	requeueControl := h.requeueControl
+	buffered := h.bufTx.BufferedUnsent()
+	hasPending := rtx || h.scb.HasPending() // A directed resend is pending work even with nothing queued.
+	if !awaitingSyn && !requeueControl && buffered == 0 && !h.closing && !hasPending {
+		// Early nop short circuit.
+		return 0, nil
+	}
+	if buffered == 0 && h.closing && (h.scb.State() != StateCloseWait || !hasPending) {
+		// If Close called and no more data to be sent, terminate connection.
+		// In CLOSE-WAIT: wait until the pending ACK is sent first, since scb.Close()
+		// overwrites pending with [FIN|ACK] (unlike ESTABLISHED which merges via bitmask).
+		h.closing = false
+		err := h.scb.Close()
+		if err != nil {
+			h.logerr("tcp.Handler.Close", slog.String("err", errstr(err)), slog.String("state", h.State().String()))
+			h.Abort()
+			return 0, io.EOF
+		}
+	}
+	// optHead is where the Handler's own options begin: after the fixed header
+	// and after any options the Policy already wrote, so neither clobbers the other.
+	optHead := int(offset) * 4
+	// Advertised MSS excludes options; subtract only the fixed header (RFC 6691).
+	mss := uint16(len(b) - sizeHeaderTCP)
+	var segment Segment
+	if awaitingSyn || requeueControl && h.scb.State() == StateSynSent {
+		// Handling init syn segment.
+		segment = ClientSynSegment(h.bufTx.iss, Size(h.bufRx.Size()))
+		offset += h.putSynOptions(b[optHead:], mss, false)
+		if requeueControl {
+			h.info("tcp.Handler:requeue-syn", slog.Uint64("port", uint64(h.localPort)), slog.Uint64("rport", uint64(h.remotePort)))
+		}
+	} else if requeueControl && h.scb.State() == StateSynRcvd {
+		segment = Segment{
+			SEQ:   h.scb.snd.UNA,
+			ACK:   h.scb.rcv.NXT,
+			WND:   Size(h.bufRx.Free()),
+			Flags: synack,
+		}
+		offset += h.putSynOptions(b[optHead:], mss, true)
+		h.info("tcp.Handler:requeue-synack", slog.Uint64("port", uint64(h.localPort)), slog.Uint64("rport", uint64(h.remotePort)))
+	} else if requeueControl {
+		h.requeueControl = false
+		return 0, nil
+	} else {
+		var ok bool
+		maxPayload := len(b) - optHead
+		if rtx {
+			// Resends are not new data, so txLimit does not apply.
+			segment, ok = h.scb.PendingRetransmit(rtxAt, maxPayload)
+		}
+		if !ok {
+			if txLimit < Size(maxPayload) {
+				// Policy clamped new data.
+				maxPayload = int(txLimit)
+			}
+			segment, ok = h.scb.PendingSegment(maxPayload)
+		}
+		if !ok && buffered > 0 && txLimit > 0 && h.policyEnabled() {
+			// Probe a closed peer window. The probe octet is resent only by the
+			// Policy's retransmission timer, so none is sent without a Policy.
+			segment, ok = h.scb.ZeroWindowProbe()
+		}
+		segment.WND = h.recvWindow()
+		if !ok {
+			// No pending control segment or data to send. Yield.
+			return 0, nil
+		} else if segment.Flags == synack {
+			offset += h.putSynOptions(b[optHead:], mss, true)
+		} else if segment.DATALEN > 0 {
+			n, err := h.bufTx.MakePacket(b[optHead:optHead+int(segment.DATALEN)], segment.SEQ)
+			if err != nil {
+				return 0, err
+			}
+			segment.DATALEN = Size(n)
+			if n > 0 {
+				segment.Flags |= FlagPSH
+			}
+		}
+	}
+	prevState := h.scb.State()
+	err = h.scb.Send(segment)
+	if err != nil {
+		return 0, err
+	} else if prevState != h.scb.State() && h.logenabled(slog.LevelInfo) {
+		h.info("tcp.Handler:tx-statechange", slog.Uint64("port", uint64(h.localPort)), slog.String("oldState", prevState.String()), slog.String("newState", h.scb.State().String()), slog.String("txflags", segment.Flags.String()))
+	}
+	h.requeueControl = false
+	h.synUnsent = false
+	tfrm.SetSourcePort(h.localPort)
+	tfrm.SetDestinationPort(h.remotePort)
+	segment.WND = h.wireWnd(segment) // wire representation only; scb keeps real octets
+	tfrm.SetSegment(segment, offset)
+	tfrm.SetUrgentPtr(0)
+	datalen := int(offset)*4 + int(segment.DATALEN)
+	if h.policyEnabled() {
+		// Frame trimmed to what is actually emitted so the Policy's Payload()
+		// is the segment data and nothing more.
+		if sent, err := NewFrame(b[:datalen]); err == nil {
+			h.policy.PostTx(h, sent)
+		}
+	}
+	if segment.Flags.HasAny(FlagRST) {
+		// A sent RST aborts the connection: tear down local state now that the
+		// reset has been written to the wire (frame already in b).
+		h.Abort()
+	} else if h.IsTxOver() {
+		// Final ACK of clean close sent. Release stack registration but keep
+		// handle so Read can still drain buffered data and report io.EOF.
+		h.connid.Add(1)
+	}
+	return datalen, nil
+}
+
+// NextSegmentSYN returns syn=true if next outgoing segment is a handshake SYN.
+// This method is exported for use by [Policy] implementations to decide handshake-only options (window scale, SACK-permitted, timestamps).
+func (h *Handler) NextSegmentSYN() (syn, ack bool) {
+	state := h.scb.State()
+	if h.AwaitingSynSend() || h.requeueControl && state == StateSynSent {
+		return true, false // SYN initial/requeue.
+	} else if h.requeueControl && state == StateSynRcvd {
+		return true, true // SYNACK requeue.
+	}
+	pending := h.scb.pending[0]
+	return pending.HasAny(FlagSYN), pending.HasAny(FlagACK)
+}
+
+// Write implements [io.Writer] by copying b to a internal buffer to be sent over the network on the next
+// [Handler.Send] call that can send data to remote peer. Use [Handler.Free] to know the maximum length the argument slice can be before erroring.
+func (h *Handler) Write(b []byte) (int, error) {
+	state := h.State()
+	if h.closing {
+		return 0, errConnectionClosing
+	} else if !state.TxDataOpen() { // Reject write call if data cannot be sent.
+		return 0, net.ErrClosed
+	}
+	return h.bufTx.Write(b)
+}
+
+// Read implements [io.Reader] by reading received data from remote peer in internal buffer.
+func (h *Handler) Read(b []byte) (n int, err error) {
+	if h.shutdownRx {
+		return 0, io.EOF
+	}
+	if h.bufRx.Buffered() > 0 {
+		n, err = h.bufRx.Read(b)
+	}
+	if n > 0 {
+		// Reading freed receive-buffer space; deliver any contiguous
+		// out-of-order data that was waiting for room.
+		h.deliverReassembled()
+		h.maybeQueueWindowUpdate()
+	}
+	if n == 0 && err == nil {
+		state := h.State()
+		if state.IsClosed() && h.isAborted() {
+			err = net.ErrClosed
+		} else if !state.RxDataOpen() {
+			err = io.EOF
+		}
+	}
+	return n, err
+}
+
+// maybeQueueWindowUpdate queues a window update ACK if the receive window has
+// opened significantly since it was last advertised. This prevents zero-window
+// deadlocks where the remote peer cannot send data because it thinks our window
+// is still 0 after we've Read() data from the buffer.
+//
+// Per RFC 9293 §3.8.6.2.2 (SWS avoidance), the window is updated when freed
+// space >= min(bufferSize/2, MSS). This applies uniformly including zero-window
+// recovery — the remote uses zero-window probes until enough space opens.
+func (h *Handler) maybeQueueWindowUpdate() {
+	currentFree := h.recvWindow()
+	lastAdvertised := h.scb.RecvWindow()
+	if currentFree <= lastAdvertised {
+		return // Window hasn't grown.
+	}
+	thresh := Size(h.bufRx.Size()) / 2
+	if mss := h.scb.snd.MSS; mss > 0 && mss < thresh {
+		thresh = mss
+	}
+	if currentFree-lastAdvertised >= thresh {
+		h.scb.pending[0] |= FlagACK
+	}
+}
+
+// SizeOutput returns the total size of the transmit ring buffer.
+func (h *Handler) SizeOutput() int {
+	return h.bufTx.Size()
+}
+
+// SizeInput returns the total size of the receive ring buffer.
+func (h *Handler) SizeInput() int {
+	return h.bufRx.Size()
+}
+
+// BufferedInput returns the number of unread bytes in the receive buffer.
+func (h *Handler) BufferedInput() int {
+	return h.bufRx.Buffered()
+}
+
+// BufferedUnsent returns the number of written but unsent bytes in the transmit buffer.
+func (h *Handler) BufferedUnsent() int {
+	return h.bufTx.BufferedUnsent()
+}
+
+// FreeOutput returns the number of free bytes in the transmit buffer.
+func (h *Handler) FreeOutput() int {
+	return h.bufTx.Free()
+}
+
+// FreeInput returns the number of free bytes in the receive buffer.
+func (h *Handler) FreeInput() int {
+	return int(h.recvWindow())
+}
+
+// recvWindow returns the receive window to advertise: free receive-buffer space
+// minus the bytes already held out of order. Subtracting them prevents the
+// sender from overrunning the receiver while a gap is open.
+func (h *Handler) recvWindow() Size {
+	free := Size(h.bufRx.Free())
+	if !h.reasm.enabled() {
+		return free
+	}
+	if ooo := Size(h.reasm.bufferedBytes()); ooo < free {
+		return free - ooo
+	}
+	return 0
+}
+
+// maxWndShift is the RFC 7323 §2.2/§2.3 cap on the window-scale shift count and
+// maxWindow the largest window it permits: the 16-bit wire field at that shift.
+const (
+	maxWndShift = 14
+	maxWindow   = 0xFFFF << maxWndShift
+)
+
+// wndShiftFor returns the smallest window-scale shift with which a receive
+// buffer of bufSize octets can be advertised in the 16-bit window field.
+func wndShiftFor(bufSize int) (shift uint8) {
+	for shift < maxWndShift && bufSize>>shift > 0xFFFF {
+		shift++
+	}
+	return shift
+}
+
+// putSynOptions writes the option block shared by SYN and SYN-ACK segments.
+// MSS always, then the NOP-padded window-scale offer. An active SYN always
+// offers scaling, since a zero shift still lets the peer scale its own window
+// (RFC 7323 §2.5). A SYN-ACK echoes the offer only when the peer's SYN carried
+// it (§2.2). Returns the number of 32-bit header words written.
+func (h *Handler) putSynOptions(b []byte, mss uint16, isSynack bool) uint8 {
+	h.optcodec.PutOption16(b, OptMaxSegmentSize, mss)
+	words := uint8(1)
+	if (!isSynack || h.peerOfferedWS) && len(b) >= 8 {
+		b[4] = byte(OptNop)
+		h.optcodec.PutOption(b[5:], OptWindowScale, h.wndShiftLocal)
+		words++
+	}
+	return words
+}
+
+// wireWnd converts a segment's real window to its on-wire representation.
+// SYN segments are never scaled (RFC7323 §2.2), we cap SYN windows at maxuint16.
+func (h *Handler) wireWnd(seg Segment) Size {
+	wnd := seg.WND
+	if h.peerOfferedWS && !seg.Flags.HasAny(FlagSYN) {
+		wnd >>= h.wndShiftLocal
+	}
+	if wnd > 0xFFFF {
+		wnd = 0xFFFF
+	}
+	return wnd
+}
+
+// AwaitingSynResponse returns true if the Handler is an active client opened with [Handler.OpenActive] and has already sent out the first SYN packet to the remote client.
+func (h *Handler) AwaitingSynResponse() bool {
+	return h.remotePort != 0 && h.scb.State() == StateSynSent
+}
+
+// IsAwaitingControl reports whether the connection is waiting for a response to
+// a control segment that can be retransmitted to advance connection state.
+func (h *Handler) IsAwaitingControl() bool {
+	return h.AwaitingSynResponse() || h.scb.State() == StateSynRcvd
+}
+
+// RequeueControl asks the next Send call to retransmit the outstanding control
+// segment, if the connection is waiting for one.
+func (h *Handler) RequeueControl() {
+	if h.IsAwaitingControl() {
+		h.requeueControl = true
+	}
+}
+
+// AwaitingSynAck returns true if the Handler is a passive server opened with [Handler.OpenListen] and not yet received a valid SYN remote packet.
+func (h *Handler) AwaitingSynAck() bool {
+	return h.remotePort == 0 && h.scb.State() == StateListen
+}
+
+// AwaitingSynSend returns true if the Handler is an active client opened with [Handler.OpenActive] and not yet sent out the first SYN packet to the remote client.
+func (h *Handler) AwaitingSynSend() bool {
+	return h.synUnsent && h.scb.State() == StateClosed
+}
+
+// IsTxOver returns true if there is no more frames to encapsulate over the network.
+// The connection is pretty much over in this case if packets made it succesfully to remote.
+func (h *Handler) IsTxOver() bool {
+	state := h.State()
+	return state == StateClosed && !h.AwaitingSynSend() ||
+		state == StateTimeWait && !h.scb.HasPending()
+}
+
+func errstr(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	return err.Error()
+}
