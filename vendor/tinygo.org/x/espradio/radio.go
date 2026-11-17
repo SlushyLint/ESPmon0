@@ -752,6 +752,7 @@ func scan() ([]AccessPoint, error) {
 			SSID:  string(raw),
 			RSSI:  int(recs[i].rssi),
 			BSSID: mac,
+			SECU:  uint8(recs[i].authmode),
 		}
 	}
 

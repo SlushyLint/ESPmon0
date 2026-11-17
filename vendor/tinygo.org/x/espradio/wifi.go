@@ -55,6 +55,7 @@ type AccessPoint struct {
 	BSSID [6]byte
 	SSID string
 	RSSI int
+	SECU uint8
 }
 
 // STAConfig configures station mode connection parameters.

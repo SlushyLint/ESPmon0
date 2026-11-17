@@ -15,11 +15,11 @@ const (
 )
 
 func main() {
-	// Give a serial monitor time to connect after the board resets.
+	// give a serial monitor time to connect after the board resets.
 	time.Sleep(time.Second)
 	fmt.Println("ESPmon0,boot")
 
-	// Enable initializes the radio; Start brings up the Wi-Fi driver.
+	// enable initializes the radio; Start brings up the Wi-Fi driver.
 	if err := espradio.Enable(espradio.Config{}); err != nil { // enable radio
 		fmt.Println("ESPmon0,error,enable,", err)
 		return
@@ -44,6 +44,7 @@ func main() {
 	//scan APs and print their results
 	var i int
 	for {
+		time.Sleep(750 * time.Millisecond)
 		ap, e := espradio.Scan()
 		if e != nil {
 			fmt.Printf("scan err: %v\n", e)
