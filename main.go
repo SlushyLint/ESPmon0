@@ -42,13 +42,17 @@ func main() {
 	fmt.Printf("\nESPmon,scanning,channel=%d\n", channel)
 
 	//scan APs and print their results
-	var i int
 	for {
 		time.Sleep(750 * time.Millisecond)
+		fmt.Printf("\x1b[2J\x1b[H")
 		ap, e := espradio.Scan()
+
 		if e != nil {
-			fmt.Printf("scan err: %v\n", e)
-			return
+			fmt.Printf("There was an error while scanning.\n")
+			fmt.Printf("Err: %v\n", e)
+			time.Sleep(5 * time.Second)
+			fmt.Printf("Continuing...\n")
+			continue
 		}
 		// RSSI is signal strength.
 		// we will also display that beside the AP, it could be potentially useful information
@@ -57,15 +61,10 @@ func main() {
 
 		for _, ap := range ap {
 			fmt.Printf("ESSID:\t%-28q\tBSSID:\t%02X", ap.SSID, ap.BSSID[0])
-			for _, i := range ap.BSSID[1:] {
-				fmt.Printf(":%02X", i)
+			for _, b := range ap.BSSID[1:] {
+				fmt.Printf(":%02X", b)
 			}
 			fmt.Printf("\tRSSI:\t%4d dBm\x1b[K\n", ap.RSSI)
-
-		}
-		if i++; i == 15 {
-			i = 0
-			fmt.Printf("\x1b[2J\x1b[H")
 
 		}
 	}
